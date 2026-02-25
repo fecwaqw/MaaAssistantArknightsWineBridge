@@ -117,7 +117,7 @@ jobs:
 
             - name: Tar files
               run: |
-                  mkdir -p release
+                  mkdir -p $GITHUB_WORKSPACE/release
                   cd build
                   tar czvf $GITHUB_WORKSPACE/release/MaaWineBridge-${{ needs.meta.outputs.tag }}-linux-${{ matrix.arch }}.tar.gz .
               working-directory: src/MaaWineBridge
