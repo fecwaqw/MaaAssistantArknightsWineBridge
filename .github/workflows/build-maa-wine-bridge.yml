@@ -1,0 +1,182 @@
+name: Dynamic Deployment
+on:
+    workflow_dispatch:
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    meta:
+        name: Gather Meta Information
+        runs-on: ubuntu-latest
+        outputs:
+            tag: ${{ steps.set_tag.outputs.tag }}
+            prerelease: ${{ steps.set_pre.outputs.prerelease }}
+        steps:
+            - name: Show concurrency group
+              run: |
+                  echo "Concurrency Group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}${{ github.ref == 'refs/heads/dev' && format('-{0}', github.sha) || '' }}"
+            - name: Checkout repository
+              uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+                  show-progress: false
+
+            - name: Set tag
+              id: set_tag
+              run: |
+                  if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+                    # For tag pushes, use the tag name
+                    tag="${{ github.ref_name }}"
+                  else
+                    # For PRs and branch pushes, use git describe or fallback
+                    tag=$(git describe --tags --match "v*" HEAD 2>/dev/null || echo "v0.0.1-$(git rev-parse --short HEAD)")
+                  fi
+                  echo "tag=${tag}" | tee -a $GITHUB_OUTPUT
+            - name: Check if it is a pre-release
+              id: set_pre
+              if: startsWith(github.ref, 'refs/tags/v')
+              run: |
+                  if [[ '${{ steps.set_tag.outputs.tag }}' =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo "prerelease=false" | tee -a $GITHUB_OUTPUT
+                  else
+                    echo "prerelease=true" | tee -a $GITHUB_OUTPUT
+                  fi
+            - name: Finalize changelog
+              if: startsWith(github.ref, 'refs/tags/v')
+              run: |
+                  this_tag=${{ steps.set_tag.outputs.tag }}
+                  if [[ '${{ steps.set_pre.outputs.prerelease }}' != 'false' ]]; then
+                    last_tag=$(git describe --tags --match "v*" --abbrev=0 --exclude='${{ steps.set_tag.outputs.tag }}')
+                  else
+                    last_tag=$(git describe --tags --match "v*" --abbrev=0 --exclude='${{ steps.set_tag.outputs.tag }}' --exclude='*-*')
+                  fi
+                  echo >> CHANGELOG.md
+                  echo "**Full Changelog**: [$last_tag -> $this_tag](https://github.com/MaaAssistantArknights/MaaAssistantArknights/compare/${last_tag}...${this_tag})" >> CHANGELOG.md
+                  echo >> CHANGELOG.md
+                  echo "[已有 Mirror酱 CDK？前往 Mirror酱 高速下载](https://mirrorchyan.com/zh/projects?rid=MAA&source=maagh-release)" >> CHANGELOG.md
+            - name: Upload changelog to GitHub
+              uses: actions/upload-artifact@v6
+              if: startsWith(github.ref, 'refs/tags/v')
+              with:
+                  name: changelog
+                  path: CHANGELOG.md
+
+    ubuntu:
+        name: Build for Ubuntu
+        needs: meta
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                arch: [aarch64, x86_64]
+            fail-fast: false
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v6
+              with:
+                  show-progress: false
+
+            - name: Fetch submodules
+              run: |
+                  git submodule update --init --depth 1 src/MaaUtils
+                  git submodule update --init --depth 1 3rdparty/EmulatorExtras
+                  git submodule update --init --depth 1 src/maa-cli
+
+            - name: Cache MaaDeps
+              id: cache-maadeps
+              uses: actions/cache@v5
+              continue-on-error: true
+              with:
+                  path: ./src/MaaUtils/MaaDeps
+                  key: ${{ runner.os }}-${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}-maadeps-${{ hashFiles('tools/maadeps-download.py') }}
+
+            - name: Install Winelib dependencies
+              run: |
+                  sudo dpkg --add-architecture i386
+                  sudo apt-get update
+                  sudo apt-get install -y wine wine64-tools wine32-tools libwine-dev build-essential
+
+            - name: Bootstrap MaaDeps
+              if: steps.cache-maadeps.outputs.cache-hit != 'true'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  python3 tools/maadeps-download.py ${{ matrix.arch == 'x86_64' && 'x64' || 'arm64' }}-linux
+
+            - name: Setup cross compile toolchains for CLI
+              uses: ./src/maa-cli/.github/actions/setup
+              with:
+                  target_arch: ${{ matrix.arch }}
+
+            - name: Build MaaWineBridge
+              run: |
+                  cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=winegcc.cmake
+                  cmake --build build
+                  cmake --install build --prefix build
+              working-directory: src/MaaWineBridge
+
+            - name: Tar files
+              run: |
+                  mkdir -p release
+                  cd build
+                  tar czvf $GITHUB_WORKSPACE/release/MaaWineBridge-${{ needs.meta.outputs.tag }}-linux-${{ matrix.arch }}.tar.gz .
+              working-directory: src/MaaWineBridge
+
+            - name: Upload MaaWineBridge to GitHub
+              uses: actions/upload-artifact@v6
+              with:
+                  name: MaaWineBridge-linux-${{ matrix.arch }}
+                  path: |
+                      release/*.tar.gz
+
+    # release:
+    #     name: Publish Release
+    #     if: startsWith(github.ref, 'refs/tags/v')
+    #     needs: [meta, ubuntu]
+    #     runs-on: ubuntu-latest
+    #     steps:
+    #         - name: Download MAA from GitHub
+    #           uses: actions/download-artifact@v7
+    #           with:
+    #               path: assets
+
+    #         - name: Clean up files
+    #           run: |
+    #               mv -vf assets/changelog/* .
+    #               rm -rf assets/MAACore-macos-*
+    #               cd assets
+    #               # find . -type f | xargs mv -fvt .
+    #               find . -type f | while read f; do mv -fvt . $f; done
+    #         - name: Publish release to GitHub
+    #           uses: softprops/action-gh-release@v2.5.0
+    #           with:
+    #               body_path: CHANGELOG.md
+    #               files: |
+    #                   assets/*
+    #               prerelease: ${{ needs.meta.outputs.prerelease != 'false' }}
+
+    #         - name: Trigger release distribution workflows
+    #           run: |
+    #               gh workflow run --repo $GITHUB_REPOSITORY release-package-distribution.yml \
+    #                 -f release_tag="${{ needs.meta.outputs.tag }}" \
+    #                 -f mirrorchyan=true \
+    #                 -f winget=${{ needs.meta.outputs.prerelease == 'false' }}
+    #               gh workflow run --repo $GITHUB_REPOSITORY mirrorchyan_release_note.yml
+    #           env:
+    #               GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    #         - name: Trigger OTA release workflow # ref: https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
+    #           run: |
+    #               gh workflow run --repo $GITHUB_REPOSITORY release-ota.yml
+    #           env:
+    #               GH_TOKEN: ${{ secrets.MISTEOWORKFLOW }}
+
+    #         - name: Create issue on failure
+    #           if: failure()
+    #           uses: actions-cool/issues-helper@v3
+    #           with:
+    #               actions: "create-issue"
+    #               title: "Errors occured during release ${{ needs.meta.outputs.tag }}"
+    #               body: |
+    #                   ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
