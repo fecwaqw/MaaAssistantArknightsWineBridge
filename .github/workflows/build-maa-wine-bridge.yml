@@ -94,7 +94,7 @@ jobs:
             - name: Install Winelib dependencies
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y wine wine64-tools libwine-dev build-essential libfontconfig-dev
+                  sudo apt-get install -y wine wine64-tools libwine-dev build-essential libfontconfig-dev libglib2.0-dev
 
             - name: Bootstrap MaaDeps
               if: steps.cache-maadeps.outputs.cache-hit != 'true'
